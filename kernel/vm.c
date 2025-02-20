@@ -5,6 +5,13 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+
+// For COW: extern declarations for kmem and refcount
+extern struct {
+  struct spinlock lock;
+  struct run *freelist;
+} kmem;
 
 /*
  * the kernel's page table.
@@ -315,7 +322,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -324,11 +330,22 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+
+    // For COW: if write bit is set, clear it and set COW bit
+    if(flags & PTE_W){
+      *pte = (*pte & ~PTE_W) | PTE_COW; // parent PTE
+      flags = (flags & ~PTE_W) | PTE_COW;
+    }
+
+    // For COW: increment refcount instead of copying data
+    acquire(&kmem.lock);
+    refcount[pa >> PGSHIFT]++;
+    release(&kmem.lock);
+
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      acquire(&kmem.lock);
+      refcount[pa >> PGSHIFT]--;
+      release(&kmem.lock);
       goto err;
     }
   }
@@ -448,4 +465,52 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+// For COW: handle a store page fault on a COW page.
+int
+handle_cowpage(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+  char *mem;
+
+  if(va >= MAXVA)
+    return -1;
+
+  pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    return -1;
+  if(!(*pte & PTE_V))
+    return -1;
+  if(!(*pte & PTE_COW))
+    return -1; // not a COW page, can't handle here
+
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+  flags = (flags & ~PTE_COW) | PTE_W; // clear COW bit, set write bit
+
+  // allocate a new page
+  if((mem = kalloc()) == 0){
+    return -1;
+  }
+  // copy original content
+  memmove(mem, (char*)pa, PGSIZE);
+
+  // decrement refcount of the old physical page
+  acquire(&kmem.lock);
+  refcount[pa >> PGSHIFT]--;
+  int rc = refcount[pa >> PGSHIFT];
+  release(&kmem.lock);
+
+  if(rc < 0)
+    panic("handle_cowpage: refcount < 0");
+
+  // install new page in PTE
+  *pte = PA2PTE(mem) | flags | PTE_V;
+
+  // flush TLB
+  sfence_vma();
+  return 0;
 }

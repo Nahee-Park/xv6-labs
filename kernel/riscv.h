@@ -363,6 +363,9 @@ typedef uint64 *pagetable_t; // 512 PTEs
 #define PTE_X (1L << 3)
 #define PTE_U (1L << 4) // user can access
 
+// For COW: use an unused bit as the COW flag (e.g. bit 9 in RSW field)
+#define PTE_COW (1L << 9) // COW bit
+
 // shift a physical address to the right place for a PTE.
 #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
 

@@ -23,11 +23,20 @@ struct {
   struct run *freelist;
 } kmem;
 
+// For COW: reference count array
+int refcount[PHYSTOP / PGSIZE];
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
   freerange(end, (void*)PHYSTOP);
+
+  // For COW: initialize all refcounts to 0
+  // (Keeps indentation + existing code structure)
+  for(int i = 0; i < (PHYSTOP >> PGSHIFT); i++){
+    refcount[i] = 0; // For COW refcount init
+  }
 }
 
 void
@@ -35,8 +44,10 @@ freerange(void *pa_start, void *pa_end)
 {
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
+    refcount[(uint64)p >> PGSHIFT] = 1; 
     kfree(p);
+  }
 }
 
 // Free the page of physical memory pointed at by pa,
@@ -51,6 +62,20 @@ kfree(void *pa)
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
+  // For COW: decrement refcount instead of freeing immediately
+  acquire(&kmem.lock);
+  uint64 paddr = (uint64)pa;
+  if(refcount[paddr >> PGSHIFT] <= 0){
+    panic("kfree refcount");
+  }
+  refcount[paddr >> PGSHIFT]--;
+  int rc = refcount[paddr >> PGSHIFT];
+  release(&kmem.lock);
+
+  if(rc > 0){
+    // still in use by other process(es), do not free
+    return;
+  }
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
 
@@ -76,7 +101,12 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r){
     memset((char*)r, 5, PGSIZE); // fill with junk
+    // For COW: set refcount = 1 on fresh allocation
+    acquire(&kmem.lock);
+    refcount[(uint64)r >> PGSHIFT] = 1;
+    release(&kmem.lock);
+  }
   return (void*)r;
 }
