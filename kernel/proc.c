@@ -308,6 +308,20 @@ fork(void)
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+  // 부모 프로세스의 VMA 정보를 자식 프로세스로 복사 
+  for(int i = 0; i < MAXVMA; ++i) {
+    // 부모프로세스의 VMA가 비어있지 않다면
+    if(p->vma[i].length) {
+        // 자식 프로세스의 VMA에 부모 프로세스의 VMA 정보를 복사
+        memmove(&(np->vma[i]), &(p->vma[i]), sizeof(struct VMA));
+        // VMA가 파일과 연결되어있는 경우 해당 파일의 참조카운트를 증가시켜 부모 자식 프로세스가 동일한 파일을 공유할 수 있도록 보장 
+        filedup(p->vma[i].file);
+    } else {
+        // 부모 프로세스의 VMA가 비어있다면 자식 프로세스의 VMA도 비어있도록 초기화
+        np->vma[i].length = 0;
+    }
+  }
+
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -357,6 +371,19 @@ exit(int status)
       struct file *f = p->ofile[fd];
       fileclose(f);
       p->ofile[fd] = 0;
+    }
+  }
+
+  // Clean up the VMA
+  for(int i = 0; i < MAXVMA; i++) {
+    struct VMA *v = &(p->vma[i]);
+    // if the VMA is not empty
+    if(v->length != 0){
+      // p-> pagetable : process page table
+      // v-> start : start address of vma
+      // v-> length/PGSIZE : number of pages that vma occupies
+        uvmunmap(p->pagetable, v->start, v->length/PGSIZE, 1);
+        v->length = 0;
     }
   }
 

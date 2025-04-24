@@ -503,3 +503,150 @@ sys_pipe(void)
   }
   return 0;
 }
+
+// 사용자 공간에서 호출되는 mmap 시스템 호출 
+// 성공하면 매핑된 메모리의 시작주소 반환, 실패하면 -1
+uint64 sys_mmap(void){
+  int length, prot, flags, fd;
+  struct file* f;
+
+  argint(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+
+  if(argfd(4, &fd, &f) < 0)
+    return -1;
+
+  if(!f->writable && (prot & PROT_WRITE) && (flags & MAP_SHARED))
+      return -1;
+
+  struct proc* p = myproc();
+  for(int i = 0; i < MAXVMA; ++i) {
+      struct VMA* v = &(p->vma[i]);
+      if(v->length == 0) {
+          v->length = length;
+          v->start = p->sz;
+          v->prot = prot;
+          v->flags = flags;
+          v->offset = 0;
+          v->file = filedup(f); 
+          length = PGROUNDUP(length);
+          p->sz += length;
+          v->end = p->sz;
+          return v->start;
+      }
+  }
+  return -1;
+}
+
+// 사용자 공간에서 호출되는 munmap 시스템 호출 처리
+// 이전에 매핑된 메모리를 해제
+
+uint64 sys_munmap(void) {
+  uint64 addr;
+  int length;
+  argaddr(0, &addr);
+  argint(1, &length);
+  struct proc* p = myproc();
+  for(int i = 0; i < MAXVMA; ++i) {
+    struct VMA* v = &(p->vma[i]);
+    if(v->length != 0 && addr < v->end && addr >= v->start) {
+      int should_close = 0;
+      int offset = v->offset;
+      addr = PGROUNDDOWN(addr);
+      length = PGROUNDUP(length);
+      if(addr == v->start) {
+        if(length == v->length) {
+          v->length = 0;
+          should_close = 1;
+        } else {
+          v->start += length;
+          v->length -= length;
+          v->offset += length;
+        }
+      } else {
+        v->length -= length;
+      }
+      if(v->flags & MAP_SHARED) {
+        filewrite_offset(v->file, addr, length, offset);
+      }
+      uvmunmap(p->pagetable, addr, length/PGSIZE, 1);
+      if(should_close)
+        fileclose(v->file);
+    }
+  }
+  return 0;
+}
+
+// 페이지 폴트가 발생했을 때 해당 주소가 VMA에 포함되어 있으면 메모리를 실제로 매핑 
+int map_mmap(struct proc *p, uint64 addr) {
+  for(int i = 0; i < MAXVMA; ++i) {
+      struct VMA* v = &(p->vma[i]);
+      if(v->length != 0 && addr < v->end && addr >= v->start) {
+          uint64 start = PGROUNDDOWN(addr);
+          uint64 offset = start - v->start + v->offset;
+
+          char* mem = kalloc();
+          if(!mem) {
+              return 0;
+          }
+          memset(mem, 0, PGSIZE);
+
+          // PROT_NONE       0x0   PTE_V (1L << 0)
+          // PROT_READ       0x1   PTE_R (1L << 1)
+          // PROT_WRITE      0x2   PTE_W (1L << 2)
+          // PROT_EXEC       0x4   PTE_X (1L << 3)
+          //                       PTE_U (1L << 4)
+          if(mappages(p->pagetable, start, PGSIZE,
+                      (uint64)mem, (v->prot<<1)|PTE_U) != 0
+            ){
+              kfree(mem);
+              return 0;
+          }
+
+          ilock(v->file->ip);
+          // readi(v->file->ip, 1, start, offset, PGSIZE);
+          if (readi(v->file->ip, 0, (uint64)mem, offset, PGSIZE) < 0) {
+            iunlock(v->file->ip);
+            kfree(mem);
+            uvmunmap(p->pagetable, start, 1, 0);
+            return 0;
+          }
+          iunlock(v->file->ip);
+          return 1;
+      }
+  }
+  return 0;
+}
+
+// 파일의 특정 offset에서부터 데이터를 쓰는 함수 
+int filewrite_offset(struct file *f, uint64 addr, int n, int offset) {
+  int r, ret = 0;
+  if(f->writable == 0)
+      return -1;
+  if(f->type != FD_INODE) {
+      panic("filewrite: only FINODE implemented!");
+  }
+
+  int max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;
+  int i = 0;
+  while(i < n) {
+      int n1 = n - i;
+      if(n1 > max)
+          n1 = max;
+
+      begin_op();
+      ilock(f->ip);
+      if ((r = writei(f->ip, 1, addr + i, offset, n1)) > 0)
+          offset += r;
+      iunlock(f->ip);
+      end_op();
+
+      if(r != n1) {
+          break;
+      }
+      i += r;
+  }
+  ret = (i == n ? n : -1);
+  return ret;
+}

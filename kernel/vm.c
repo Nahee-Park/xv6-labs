@@ -183,19 +183,20 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
   if((va % PGSIZE) != 0)
     panic("uvmunmap: not aligned");
 
-  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
-    if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
-    if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+  // continue로 업데이트 
+  for(a = va; a < va + npages*PGSIZE; a += PGSIZE) {
+    if((pte = walk(pagetable, a, 0)) == 0) 
+      // panic("uvmunmap: walk");
+      continue;
     if(PTE_FLAGS(*pte) == PTE_V)
-      panic("uvmunmap: not a leaf");
-    if(do_free){
-      uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+        panic("uvmunmap: not a leaf");
+    if(do_free && (*pte & PTE_V) != 0){
+        uint64 pa = PTE2PA(*pte);
+        kfree((void*)pa);
     }
     *pte = 0;
   }
+
 }
 
 // create an empty user page table.
@@ -321,7 +322,8 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+      // panic("uvmcopy: page not present");
+      continue;
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
