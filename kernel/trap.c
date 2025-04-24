@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -46,13 +47,12 @@ usertrap(void)
   w_stvec((uint64)kernelvec);
 
   struct proc *p = myproc();
-  
+
   // save user program counter.
   p->trapframe->epc = r_sepc();
-  
+
   if(r_scause() == 8){
     // system call
-
     if(killed(p))
       exit(-1);
 
@@ -66,16 +66,47 @@ usertrap(void)
 
     syscall();
   } else if((which_dev = devintr()) != 0){
-    // ok
+    // ok: device interrupt
   } else if(r_scause() == 0xd || r_scause() == 0xf) {
-    if(!map_mmap(p, r_stval())) {
-      printf("usertrap(): unexpected scause %lx pid=%d\n", r_scause(), p->pid);
-      printf("            sepc=%lx stval=%lx\n", r_sepc(), r_stval());
+    // lazy mmap page-fault handling (load=0xd, store=0xf)
+    uint64 fault_va = r_stval();
+    int is_store = (r_scause() == 0xf);
+    int allowed = 0;
+
+    // check if fault_va lies within a valid VMA and has appropriate permissions
+    for(int i = 0; i < MAXVMA; i++){
+      struct VMA *v = &p->vma[i];
+      if(v->length > 0 && fault_va >= v->start && fault_va < v->end){
+        if(!is_store){
+          // read fault: always allowed for VMA
+          allowed = 1;
+        } else if(v->prot & PROT_WRITE){
+          // write fault: allowed only if VMA has write permission
+          allowed = 1;
+        }
+        break;
+      }
+    }
+
+    if(allowed){
+      if(!map_mmap(p, fault_va)){
+        // lazy-map failed unexpectedly
+        printf("usertrap(): unexpected scause %lx pid=%d\n",
+               r_scause(), p->pid);
+        printf("            sepc=0x%lx stval=0x%lx\n",
+               r_sepc(), r_stval());
+        p->killed = 1;
+      }
+    } else {
+      // e.g., write to read-only mmap region -> terminate
       p->killed = 1;
     }
   } else {
-    printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
-    printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+    // everything else: kill the process
+    printf("usertrap(): unexpected scause 0x%lx pid=%d\n",
+           r_scause(), p->pid);
+    printf("            sepc=0x%lx stval=0x%lx\n",
+           r_sepc(), r_stval());
     setkilled(p);
   }
 

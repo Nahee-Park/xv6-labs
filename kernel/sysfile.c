@@ -542,42 +542,69 @@ uint64 sys_mmap(void){
 
 // 사용자 공간에서 호출되는 munmap 시스템 호출 처리
 // 이전에 매핑된 메모리를 해제
-
-uint64 sys_munmap(void) {
+uint64
+sys_munmap(void) {
   uint64 addr;
-  int length;
+  int length, npages;
+  struct proc *p = myproc();
+
+  // 인자 수집
   argaddr(0, &addr);
   argint(1, &length);
-  struct proc* p = myproc();
-  for(int i = 0; i < MAXVMA; ++i) {
-    struct VMA* v = &(p->vma[i]);
-    if(v->length != 0 && addr < v->end && addr >= v->start) {
-      int should_close = 0;
-      int offset = v->offset;
-      addr = PGROUNDDOWN(addr);
-      length = PGROUNDUP(length);
-      if(addr == v->start) {
-        if(length == v->length) {
-          v->length = 0;
-          should_close = 1;
-        } else {
-          v->start += length;
-          v->length -= length;
-          v->offset += length;
-        }
-      } else {
-        v->length -= length;
-      }
-      if(v->flags & MAP_SHARED) {
-        filewrite_offset(v->file, addr, length, offset);
-      }
-      uvmunmap(p->pagetable, addr, length/PGSIZE, 1);
-      if(should_close)
+
+  // 페이지 정렬
+  uint64 a = PGROUNDDOWN(addr);
+  int len = PGROUNDUP(length);
+  npages = len / PGSIZE;
+
+  // 각 VMA 슬롯 검사
+  for(int i = 0; i < MAXVMA; i++) {
+    struct VMA *v = &p->vma[i];
+    // 비어있거나 범위 밖이면 건너뛰기
+    if(v->length == 0 || a < v->start || a >= v->start + v->length)
+      continue;
+
+    // ─── unmap at START ─────────────────────────────────────────
+    if(a == v->start) {
+      // ─── full unmap ────────────────────────────────────────────
+      if(len >= v->length) {
+        if(v->flags & MAP_SHARED)
+          filewrite_offset(v->file, v->start, v->length, v->offset);
+        uvmunmap(p->pagetable, v->start, v->length/PGSIZE, 1);
         fileclose(v->file);
+        // VMA 슬롯 완전 초기화
+        v->file   = 0;
+        v->start  = 0;
+        v->length = 0;
+        v->end    = 0;
+        v->offset = 0;
+        v->prot   = 0;
+        v->flags  = 0;
+      }
+      // ─── partial unmap at START ────────────────────────────────
+      else {
+        if(v->flags & MAP_SHARED)
+          filewrite_offset(v->file, v->start, len, v->offset);
+        uvmunmap(p->pagetable, v->start, npages, 1);
+        v->start  += len;
+        v->offset += len;
+        v->length -= len;
+        v->end     = v->start + v->length;
+      }
+    }
+    // ─── unmap at END ───────────────────────────────────────────
+    else {
+      if(v->flags & MAP_SHARED)
+        filewrite_offset(v->file, a, len, v->offset);
+      uvmunmap(p->pagetable, a, npages, 1);
+      v->length -= len;
+      v->end     = v->start + v->length;
     }
   }
+
   return 0;
 }
+
 
 // 페이지 폴트가 발생했을 때 해당 주소가 VMA에 포함되어 있으면 메모리를 실제로 매핑 
 int
