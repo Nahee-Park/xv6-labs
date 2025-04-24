@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h" 
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -579,74 +580,73 @@ uint64 sys_munmap(void) {
 }
 
 // 페이지 폴트가 발생했을 때 해당 주소가 VMA에 포함되어 있으면 메모리를 실제로 매핑 
-int map_mmap(struct proc *p, uint64 addr) {
-  for(int i = 0; i < MAXVMA; ++i) {
-      struct VMA* v = &(p->vma[i]);
-      if(v->length != 0 && addr < v->end && addr >= v->start) {
-          uint64 start = PGROUNDDOWN(addr);
-          uint64 offset = start - v->start + v->offset;
+int
+map_mmap(struct proc *p, uint64 va_fault)
+{
+  for(int i = 0; i < MAXVMA; i++){
+    struct VMA *v = &p->vma[i];
+    if(v->length == 0) continue;
+    if(va_fault < v->end && va_fault >= v->start){
 
-          char* mem = kalloc();
-          if(!mem) {
-              return 0;
-          }
-          memset(mem, 0, PGSIZE);
+      uint64 va_page = PGROUNDDOWN(va_fault);
+      uint64 file_off = va_page - v->start + v->offset;
 
-          // PROT_NONE       0x0   PTE_V (1L << 0)
-          // PROT_READ       0x1   PTE_R (1L << 1)
-          // PROT_WRITE      0x2   PTE_W (1L << 2)
-          // PROT_EXEC       0x4   PTE_X (1L << 3)
-          //                       PTE_U (1L << 4)
-          if(mappages(p->pagetable, start, PGSIZE,
-                      (uint64)mem, (v->prot<<1)|PTE_U) != 0
-            ){
-              kfree(mem);
-              return 0;
-          }
+      char *kva = kalloc();
+      if(kva == 0) return 0;
+      memset(kva, 0, PGSIZE);
+      
+      uint64 pa = (uint64)kva;
+      uint flags = (v->prot << 1) | PTE_U | PTE_A | PTE_D;
 
-          ilock(v->file->ip);
-          // readi(v->file->ip, 1, start, offset, PGSIZE);
-          if (readi(v->file->ip, 0, (uint64)mem, offset, PGSIZE) < 0) {
-            iunlock(v->file->ip);
-            kfree(mem);
-            uvmunmap(p->pagetable, start, 1, 0);
-            return 0;
-          }
-          iunlock(v->file->ip);
-          return 1;
+      if(mappages(p->pagetable, va_page, PGSIZE, pa, flags) != 0){
+        kfree(kva);
+        return 0;
       }
+    
+      ilock(v->file->ip);
+      if(readi(v->file->ip, 0, (uint64)kva, file_off, PGSIZE) < 0){
+        iunlock(v->file->ip);
+        kfree(kva);
+        uvmunmap(p->pagetable, va_page, 1, 0);
+        return 0;
+      }
+      iunlock(v->file->ip);
+      return 1;
+    }
   }
   return 0;
 }
 
 // 파일의 특정 offset에서부터 데이터를 쓰는 함수 
-int filewrite_offset(struct file *f, uint64 addr, int n, int offset) {
-  int r, ret = 0;
-  if(f->writable == 0)
-      return -1;
-  if(f->type != FD_INODE) {
-      panic("filewrite: only FINODE implemented!");
+int
+filewrite_offset(struct file *f, uint64 addr, int n, int offset)
+{
+  if(f->writable == 0 || f->type != FD_INODE)
+    return -1;
+
+  // current file size
+  int remain = f->ip->size - offset;
+  if(remain <= 0)
+    return -1;                 // 쓰면 안 되는 범위
+  if(n > remain)               // 파일 끝을 넘지 않도록 절단
+    n = remain;
+
+  int max = ((MAXOPBLOCKS-1-1-2)/2) * BSIZE;
+  int i = 0, r;
+
+  while(i < n){
+    int n1 = n - i;
+    if(n1 > max) n1 = max;
+
+    begin_op();
+    ilock(f->ip);
+    r = writei(f->ip, 1 /*USER buf*/,  addr + i, offset, n1);
+    iunlock(f->ip);
+    end_op();
+
+    if(r != n1) break;
+    offset += r;
+    i += r;
   }
-
-  int max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;
-  int i = 0;
-  while(i < n) {
-      int n1 = n - i;
-      if(n1 > max)
-          n1 = max;
-
-      begin_op();
-      ilock(f->ip);
-      if ((r = writei(f->ip, 1, addr + i, offset, n1)) > 0)
-          offset += r;
-      iunlock(f->ip);
-      end_op();
-
-      if(r != n1) {
-          break;
-      }
-      i += r;
-  }
-  ret = (i == n ? n : -1);
-  return ret;
+  return (i == n) ? n : -1;
 }
